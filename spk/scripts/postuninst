@@ -1,0 +1,11 @@
+#!/bin/sh
+# 卸载后：清理反向代理配置与临时文件
+# 注意：用户/用户组由 DSM 依据 conf/privilege 自动创建与回收，此处不手动删除
+. "$(dirname "$0")/common.sh"
+
+PROXY_CONF="/usr/local/etc/nginx/conf.d/${PKG}.conf"
+# 降权运行时无权删除 root 拥有的 nginx 配置，失败可忽略（手动删即可）
+[ -f "${PROXY_CONF}" ] && rm -f "${PROXY_CONF}" 2>/dev/null
+
+rm -f "${PID_FILE}"
+exit 0

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>群晖电信同步工具 · 天翼网盘同步</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"></span>
+    <div>
+      <h1>群晖电信同步工具</h1>
+      <p>本地文件夹 → 天翼网盘</p>
+    </div>
+  </div>
+  <div class="status-strip" id="statusStrip">
+    <span class="chip" id="chipService">服务检查中</span>
+    <span class="chip" id="chipAccount">账号未连接</span>
+    <span class="chip" id="chipDisk">容量未知</span>
+    <span class="chip ghost" id="chipVersion"></span>
+  </div>
+</header>
+
+<main>
+  <section class="card notice" id="aclNotice" hidden>
+    <div class="card-head">
+      <h2>目录权限</h2>
+      <div class="card-actions">
+        <button class="btn ghost" id="btnRecheckAcl">重新检查</button>
+      </div>
+    </div>
+    <div id="aclList" class="acl-list"></div>
+    <p class="hint">
+      DSM 7 要求套件以非特权账号运行，同步目录需要单独授权。任选一种方式：
+      <br />
+      ① DSM 界面：控制面板 → 共享文件夹 → 编辑 → 权限 → 系统内部用户 → 勾选 <code>sc-qunhuisync</code> → 读写；
+      <br />
+      ② SSH 执行：<code>sudo /var/packages/qunhuisync/target/scripts/grant-access.sh /volume1/你的目录</code>
+    </p>
+  </section>
+
+  <section class="card" id="accountCard">
+    <div class="card-head">
+      <h2>天翼网盘账号</h2>
+      <div class="card-actions">
+        <button class="btn primary" id="btnQrLogin">扫码登录</button>
+      </div>
+    </div>
+    <div class="grid">
+      <label>根目录 ID<input id="accRoot" placeholder="-11" /></label>
+      <label>上传线程数（同时上传几个文件）
+        <input id="accThreads" type="number" min="1" max="8" value="3" />
+      </label>
+      <label>网页访问密码（可选）<input id="accWebPassword" type="password" placeholder="留空表示不启用" /></label>
+    </div>
+    <div class="qr-box" id="qrBox" hidden>
+      <div class="qr-head">
+        <span>请用「天翼云盘」App 扫描下方二维码</span>
+        <button class="btn ghost small" id="btnQrRefresh">换一张</button>
+      </div>
+      <img id="qrImg" alt="登录二维码" />
+      <p class="hint" id="qrHint">正在等待扫码…</p>
+    </div>
+    <p class="hint">
+      提示：<b>只用扫码登录</b>——用手机上的「天翼云盘」App 扫一次即可，
+      不用记密码，也不会撞上天翼的滑块验证码。登录状态会保存，
+      套件重启后自动续期。
+    </p>
+    <div class="row-end">
+      <button class="btn primary" id="btnSaveAccount">保存账号设置</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>同步规则</h2>
+      <div class="card-actions">
+        <button class="btn primary" id="btnNewRule">新建规则</button>
+      </div>
+    </div>
+    <div id="ruleList" class="rule-list"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>当前任务</h2>
+      <div class="card-actions">
+        <span class="chip ghost" id="chipJobs">空闲</span>
+        <a class="btn ghost" href="/logs.html" target="_blank">查看日志</a>
+        <button class="btn ghost" id="btnRefresh">刷新</button>
+      </div>
+    </div>
+    <div id="jobList" class="job-list"></div>
+  </section>
+</main>
+
+<div class="modal" id="ruleModal" hidden>
+  <div class="modal-card">
+    <div class="card-head">
+      <h2 id="ruleModalTitle">新建规则</h2>
+      <button class="btn ghost" id="btnCloseModal">关闭</button>
+    </div>
+    <div class="grid">
+      <label>规则名称<input id="fName" placeholder="例如：家庭照片归档" /></label>
+      <label>本地目录
+        <span class="path-row">
+          <input id="fLocal" placeholder="/volume1/photos" />
+          <button type="button" class="btn small" id="btnBrowse">浏览</button>
+        </span>
+      </label>
+      <label>远端目录<input id="fRemote" placeholder="/群晖电信同步/照片" /></label>
+      <label>计划
+        <select id="fScheduleType">
+          <option value="manual">仅手动</option>
+          <option value="interval">按间隔</option>
+          <option value="daily">每天定时</option>
+        </select>
+      </label>
+      <label id="wrapInterval" hidden>间隔（分钟）<input id="fInterval" type="number" min="1" value="60" /></label>
+      <label id="wrapDaily" hidden>每天时间（HH:MM）<input id="fDaily" placeholder="02:00" /></label>
+      <label>文件类型过滤（逗号分隔，留空表示全部）<input id="fInclude" placeholder="*.mp4" /></label>
+      <label>排除规则（逗号分隔）<input id="fExclude" placeholder="*.tmp, @eaDir" /></label>
+      <label>最小文件大小
+        <span class="path-row">
+          <input id="fMinSize" type="number" min="0" step="any" value="0" />
+          <select id="fMinSizeUnit">
+            <option value="1">字节</option>
+            <option value="1024">KB</option>
+            <option value="1048576" selected>MB</option>
+            <option value="1073741824">GB</option>
+          </select>
+        </span>
+      </label>
+      <label>校验方式
+        <select id="fVerify">
+          <option value="size">大小一致（推荐）</option>
+          <option value="md5">MD5 强校验（回读文件）</option>
+          <option value="none">不校验</option>
+        </select>
+      </label>
+    </div>
+    <div class="dir-picker" id="dirPicker" hidden></div>
+    <div class="switches">
+      <label class="switch"><input type="checkbox" id="fEnabled" checked /><span>启用规则</span></label>
+      <label class="switch"><input type="checkbox" id="fRecursive" checked /><span>包含子目录</span></label>
+      <label class="switch"><input type="checkbox" id="fPreserve" checked /><span>保留目录结构</span></label>
+      <label class="switch danger"><input type="checkbox" id="fDelete" /><span>同步成功后删除源文件</span></label>
+      <label class="switch"><input type="checkbox" id="fOverwrite" checked /><span>覆盖云端同名文件</span></label>
+      <label class="switch"><input type="checkbox" id="fDeleteEmpty" /><span>删除本地空目录</span></label>
+      <label class="switch danger"><input type="checkbox" id="fDeleteZero" /><span>删除 0 字节文件（不上传）</span></label>
+    </div>
+    <p class="hint" id="ruleHint">删除源文件前会先校验云端文件与本地一致，校验通过后<b>直接删除</b>（不留回收站副本，删了就没了，请谨慎开启）。0 字节文件不上传，直接删除。</p>
+    <div class="row-end">
+      <button class="btn primary" id="btnSaveRule">保存规则</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

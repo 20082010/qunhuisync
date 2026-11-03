@@ -1,0 +1,32 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 本地调试 / 截图
+.screenshots/
+build/tmp-*/
+build/dev-*.json
+build/dev-*.png
+build/dev-*.txt
+build/state.json
+build/dev-config.json
+
+# 构建中间产物
+build/package/
+build/inner/
+build/wheels/
+build/PACKAGE_ICON.PNG
+build/__pycache__/
+
+# 构建产物（可由 build/build_spk.py 重新生成）
+dist/
+
+# 本地配置（含账号、令牌）
+config.json
+token.json
+state.json
+*.local.json
+.env

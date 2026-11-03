@@ -1,0 +1,41 @@
+#!/bin/sh
+# 升级后：确保可写目录与配置就位，然后启动服务
+#
+# 升级时 /var/packages/<pkg>/var 会被保留，账号配置与令牌都在里面，
+# 这里只做兜底创建，不覆盖已有配置。
+. "$(dirname "$0")/common.sh"
+
+mkdir -p "${VAR_DIR}" "${CONFIG_DIR}" 2>/dev/null
+chmod 750 "${VAR_DIR}" 2>/dev/null
+chmod 700 "${CONFIG_DIR}" 2>/dev/null
+
+if [ ! -f "${CONFIG_FILE}" ]; then
+    cat > "${CONFIG_FILE}" <<'EOF'
+{
+  "version": 1,
+  "cloud": {
+    "username": "",
+    "password": "",
+    "root_folder_id": "-11",
+    "upload_threads": 3
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8686,
+    "password": ""
+  },
+  "trash": {
+    "retention_days": 7,
+    "path": ""
+  },
+  "rules": []
+}
+EOF
+    chmod 600 "${CONFIG_FILE}"
+fi
+
+"$(dirname "$0")/start-stop-status" start
+
+PORT="$(get_port)"
+echo "${APP_NAME} 升级完成，访问地址：http://<群晖IP>:${PORT}/"
+exit 0

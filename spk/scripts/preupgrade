@@ -1,0 +1,16 @@
+#!/bin/sh
+# 升级前检查：依赖 Python 3.8+
+#
+# DSM 7 的升级顺序是：
+#   preupgrade -> preuninst -> postuninst -> preinst -> postinst -> postupgrade
+# 升级时 preuninst/postuninst 也会执行，所以这里只做检查，不做有副作用的操作。
+. "$(dirname "$0")/common.sh"
+
+if ! PYTHON="$(find_python)"; then
+    echo "${APP_NAME} 需要 Python 3.8 或更高版本。"
+    echo "请先在套件中心安装「Python 3」，再升级本套件。"
+    exit 1
+fi
+
+echo "使用 Python: ${PYTHON}"
+exit 0

@@ -1,0 +1,99 @@
+#!/bin/sh
+# 套件生命周期：start / stop / status / restart / log
+# DSM 7 下由 conf/privilege 决定运行身份（sc-qunhuisync）
+. "$(dirname "$0")/common.sh"
+
+is_running() {
+    [ -f "${PID_FILE}" ] || return 1
+    PID="$(cat "${PID_FILE}" 2>/dev/null)"
+    [ -n "${PID}" ] || return 1
+    kill -0 "${PID}" 2>/dev/null
+}
+
+start_service() {
+    if is_running; then
+        echo "${APP_NAME} 已在运行"
+        return 0
+    fi
+    if ! PYTHON="$(find_python)"; then
+        echo "未找到 Python 3.8+，无法启动 ${APP_NAME}"
+        return 1
+    fi
+
+    PORT="$(get_port)"
+    mkdir -p "${VAR_DIR}" "${CONFIG_DIR}"
+    cd "${APP_DIR}" || return 1
+
+    # DSM 提供的日志文件不可写时（降权运行的常见情况）改写到 var/ 下
+    LOG_TARGET="${LOG_FILE}"
+    if ! touch "${LOG_TARGET}" 2>/dev/null; then
+        LOG_TARGET="${VAR_DIR}/${PKG}.log"
+        touch "${LOG_TARGET}" 2>/dev/null
+    fi
+
+    PYTHONPATH="${DEPS_DIR}:${EXTRA_DEPS_DIR}:${APP_CODE_DIR}" \
+    nohup "${PYTHON}" -m qunhuisync serve \
+        --config "${CONFIG_FILE}" \
+        --host 0.0.0.0 \
+        --port "${PORT}" \
+        >> "${LOG_TARGET}" 2>&1 &
+    echo $! > "${PID_FILE}"
+
+    sleep 2
+    if is_running; then
+        echo "${APP_NAME} 已启动（端口 ${PORT}）"
+        return 0
+    fi
+    echo "${APP_NAME} 启动失败，请查看 ${LOG_FILE}"
+    return 1
+}
+
+stop_service() {
+    if ! is_running; then
+        rm -f "${PID_FILE}"
+        return 0
+    fi
+    PID="$(cat "${PID_FILE}")"
+    kill "${PID}" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        is_running || break
+        sleep 1
+    done
+    if is_running; then
+        kill -9 "${PID}" 2>/dev/null
+    fi
+    rm -f "${PID_FILE}"
+    echo "${APP_NAME} 已停止"
+    return 0
+}
+
+case "$1" in
+    start)
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        stop_service
+        start_service
+        ;;
+    status)
+        if is_running; then
+            exit 0
+        fi
+        exit 1
+        ;;
+    log)
+        if [ -f "${LOG_FILE}" ]; then
+            tail -n 300 "${LOG_FILE}"
+        elif [ -f "${VAR_DIR}/${PKG}.log" ]; then
+            tail -n 300 "${VAR_DIR}/${PKG}.log"
+        fi
+        exit 0
+        ;;
+    *)
+        echo "用法: $0 {start|stop|restart|status|log}"
+        exit 1
+        ;;
+esac

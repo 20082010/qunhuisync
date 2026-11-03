@@ -1,0 +1,59 @@
+#!/bin/sh
+# 安装后：准备可写目录、依赖与配置，然后启动服务
+# DSM 7 下以服务账号 sc-qunhuisync 运行
+. "$(dirname "$0")/common.sh"
+
+# 1. 可写目录（降权后服务账号只能写这里）
+mkdir -p "${VAR_DIR}" "${CONFIG_DIR}" 2>/dev/null
+chmod 750 "${VAR_DIR}" 2>/dev/null
+chmod 700 "${CONFIG_DIR}" 2>/dev/null
+
+# 2. 依赖自检：加密库已随包安装在 deps/Crypto
+if [ -d "${DEPS_DIR}/Crypto" ]; then
+    echo "已安装 $(get_arch) 架构的运行依赖"
+elif [ -x "$(find_python)" ]; then
+    # target/ 由 root 拥有，降权后不可写，装到 var/ 下
+    echo "未找到加密库，尝试使用 pip 安装到 ${EXTRA_DEPS_DIR}"
+    PYTHON="$(find_python)"
+    mkdir -p "${EXTRA_DEPS_DIR}"
+    "${PYTHON}" -m pip install --upgrade --target "${EXTRA_DEPS_DIR}" pycryptodome >/dev/null 2>&1 \
+        || echo "警告：pycryptodome 安装失败，请检查网络或手动安装"
+else
+    echo "警告：缺少 Python 运行环境"
+fi
+
+# 3. 默认配置
+if [ ! -f "${CONFIG_FILE}" ]; then
+    cat > "${CONFIG_FILE}" <<'EOF'
+{
+  "version": 1,
+  "cloud": {
+    "username": "",
+    "password": "",
+    "root_folder_id": "-11",
+    "upload_threads": 3
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8686,
+    "password": ""
+  },
+  "trash": {
+    "retention_days": 7,
+    "path": ""
+  },
+  "rules": []
+}
+EOF
+    chmod 600 "${CONFIG_FILE}"
+fi
+
+# 4. 启动服务
+"$(dirname "$0")/start-stop-status" start
+
+PORT="$(get_port)"
+echo "${APP_NAME} 安装完成，访问地址：http://<群晖IP>:${PORT}/"
+echo "提示：同步目录需要授予服务账号 ${SERVICE_USER} 读写权限，"
+echo "      可在 Web 界面的规则卡片上查看权限状态，或执行："
+echo "      sudo ${GRANT_SCRIPT} <目录>"
+exit 0

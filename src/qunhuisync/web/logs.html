@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>群晖电信同步工具 · 日志</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"></span>
+    <div>
+      <h1>同步日志</h1>
+      <p>任务历史与逐行日志</p>
+    </div>
+  </div>
+  <div class="status-strip">
+    <span class="chip ghost" id="chipAuto">自动刷新：开</span>
+    <button class="btn ghost" id="btnAuto">关闭自动刷新</button>
+    <button class="btn ghost" id="btnRefresh">刷新</button>
+    <a class="btn ghost" href="/">返回主界面</a>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="card-head">
+      <h2>任务历史</h2>
+      <div class="card-actions">
+        <span class="chip ghost" id="chipCount">0 条</span>
+      </div>
+    </div>
+    <div id="historyList" class="rule-list"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2 id="logTitle">日志</h2>
+      <div class="card-actions">
+        <span class="chip ghost" id="chipLogMeta">选择左侧任务查看日志</span>
+      </div>
+    </div>
+    <pre class="logs logs-page" id="logBox">尚未选择任务。</pre>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let webPassword = localStorage.getItem('qhs_password') || '';
+let selectedId = '';
+let autoRefresh = true;
+
+function headers() {
+  const h = { 'Content-Type': 'application/json' };
+  if (webPassword) h['X-QHS-Password'] = webPassword;
+  return h;
+}
+
+async function api(path) {
+  const res = await fetch(path, { headers: headers() });
+  if (res.status === 401) {
+    const pwd = prompt('请输入网页访问密码');
+    if (pwd) {
+      webPassword = pwd;
+      localStorage.setItem('qhs_password', pwd);
+      return api(path);
+    }
+    throw new Error('未授权');
+  }
+  return res.json();
+}
+
+function escapeHtml(text) {
+  return String(text === undefined || text === null ? '' : text)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function humanSize(num) {
+  if (num === undefined || num === null) return '-';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let size = Number(num);
+  let i = 0;
+  while (size >= 1024 && i < units.length - 1) { size = size / 1024; i += 1; }
+  return `${size.toFixed(1)} ${units[i]}`;
+}
+
+function statusText(status) {
+  return { success: '成功', partial: '部分失败', failed: '失败',
+           running: '进行中', cancelled: '已取消', skipped: '已跳过' }[status] || status || '-';
+}
+
+function statusClass(status) {
+  if (status === 'success') return 'ok';
+  if (status === 'running') return 'warn';
+  if (status === 'cancelled' || status === 'skipped') return 'ghost';
+  return 'bad';
+}
+
+async function loadHistory() {
+  const data = await api('/api/jobs/history?limit=100');
+  const jobs = data.jobs || [];
+  $('chipCount').textContent = `${jobs.length} 条`;
+  if (!jobs.length) {
+    $('historyList').innerHTML = '<div class="empty">还没有任务记录。</div>';
+    return;
+  }
+  $('historyList').innerHTML = jobs.map((job) => {
+    const time = job.started ? new Date(job.started * 1000).toLocaleString() : '-';
+    const duration = job.finished && job.started
+      ? Math.max(0, Math.round(job.finished - job.started)) + ' 秒' : '-';
+    const active = job.id === selectedId ? ' active' : '';
+    return `
+      <div class="rule log-rule${active}" data-id="${escapeHtml(job.id)}">
+        <div class="rule-top">
+          <div>
+            <div class="rule-title">${escapeHtml(job.rule_name || job.rule_id)}
+              <span class="chip ${statusClass(job.status)}">${escapeHtml(statusText(job.status))}</span>
+            </div>
+            <div class="rule-path">${time} · 用时 ${duration} · 上传 ${job.uploaded} · 失败 ${job.failed} · ${humanSize(job.bytes_uploaded)}</div>
+          </div>
+          <div class="rule-actions">
+            <button class="btn small ghost" data-act="log" data-id="${escapeHtml(job.id)}">查看日志</button>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  $('historyList').querySelectorAll("button[data-act='log']").forEach((btn) => {
+    btn.addEventListener('click', () => loadLogs(btn.dataset.id));
+  });
+  $('historyList').querySelectorAll('.log-rule').forEach((row) => {
+    row.addEventListener('click', (ev) => {
+      if (ev.target.tagName === 'BUTTON') return;
+      loadLogs(row.dataset.id);
+    });
+  });
+}
+
+async function loadLogs(jobId) {
+  if (!jobId) return;
+  selectedId = jobId;
+  const data = await api('/api/job/logs?id=' + encodeURIComponent(jobId));
+  $('logTitle').textContent = '日志 · ' + (data.rule_name || data.id || '');
+  $('chipLogMeta').textContent = `${statusText(data.status)} · ${data.logs.length} 行`;
+  $('logBox').textContent = (data.logs || []).join('\n') || '（这个任务没有日志）';
+  $('logBox').scrollTop = $('logBox').scrollHeight;
+  loadHistory();
+}
+
+async function refreshAll() {
+  try {
+    await loadHistory();
+    if (selectedId) {
+      const data = await api('/api/job/logs?id=' + encodeURIComponent(selectedId));
+      $('chipLogMeta').textContent = `${statusText(data.status)} · ${data.logs.length} 行`;
+      $('logBox').textContent = (data.logs || []).join('\n') || '（这个任务没有日志）';
+    }
+  } catch (err) {
+    $('logBox').textContent = '读取失败：' + err.message;
+  }
+}
+
+$('btnRefresh').addEventListener('click', refreshAll);
+$('btnAuto').addEventListener('click', () => {
+  autoRefresh = !autoRefresh;
+  $('chipAuto').textContent = '自动刷新：' + (autoRefresh ? '开' : '关');
+  $('btnAuto').textContent = autoRefresh ? '关闭自动刷新' : '开启自动刷新';
+});
+
+const params = new URLSearchParams(location.search);
+if (params.get('id')) loadLogs(params.get('id'));
+loadHistory();
+setInterval(() => { if (autoRefresh) refreshAll(); }, 3000);
+</script>
+</body>
+</html>

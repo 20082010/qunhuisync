@@ -1,0 +1,12 @@
+#!/bin/sh
+# 安装前检查：依赖 Python 3.8+
+. "$(dirname "$0")/common.sh"
+
+if ! PYTHON="$(find_python)"; then
+    echo "${APP_NAME} 需要 Python 3.8 或更高版本。"
+    echo "请先在套件中心安装「Python 3」，再安装本套件。"
+    exit 1
+fi
+
+echo "使用 Python: ${PYTHON}"
+exit 0

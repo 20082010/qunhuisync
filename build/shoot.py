@@ -22,7 +22,29 @@ SHOTS = [
     ("04-任务日志.png", "#jobDemo"),
     ("05-目录权限.png", "#aclDemo"),
     ("06-扫码登录.png", "#qrDemo"),
+    ("07-账号设置.png", "#accountCard"),
 ]
+
+# 演示用：伪造当前任务，展示「哈希阶段」和「传输阶段」两种进度
+DEMO_RUNNING = """
+window.__demoRunning = [{
+  id:'r1', rule_id:'rule_photos', rule_name:'家庭照片归档', status:'running',
+  started:1793190000, finished:0, scanned:12, uploaded:2, skipped:0, deleted:0,
+  zero_deleted:0, failed:0, bytes_uploaded:52428800, message:'',
+  cancel_requested:false, current_index:3, current_total_files:12,
+  files:[
+    {path:'/volume1/photos/20241012_091530.mp4', name:'20241012_091530.mp4',
+     size:2147483648, done:1073741824, speed:3145728, percent:50, cancelled:false,
+     elapsed:320, hashing:false, hash_done:0, hash_size:0, hash_percent:0},
+    {path:'/volume1/photos/20241012_140215.mp4', name:'20241012_140215.mp4',
+     size:1073741824, done:0, speed:0, percent:0, cancelled:false,
+     elapsed:40, hashing:true, hash_done:322122547, hash_size:1073741824, hash_percent:30},
+    {path:'/volume1/photos/IMG_20241012.jpg', name:'IMG_20241012.jpg',
+     size:5242880, done:3145728, speed:1048576, percent:60, cancelled:false,
+     elapsed:12, hashing:false, hash_done:0, hash_size:0, hash_percent:0}
+  ]
+}];
+"""
 
 # 演示用：伪造两条已完成任务，让「任务与日志」面板有内容
 DEMO_JOBS = """
@@ -132,12 +154,19 @@ def main() -> int:
         page.goto(BASE, wait_until="networkidle")
         page.wait_for_timeout(1200)
         page.evaluate(DEMO_JOBS)
+        page.evaluate(DEMO_RUNNING)
 
         for name, click in SHOTS:
             if click == "#jobDemo":
                 page.evaluate("STATE.jobs = window.__demoJobs; renderJobs();")
                 page.wait_for_timeout(400)
                 page.locator("#jobList").scroll_into_view_if_needed()
+                page.wait_for_timeout(300)
+            elif click == "#accountCard":
+                # 「当前任务」面板展示哈希阶段 + 传输阶段
+                page.evaluate("STATE.jobs = window.__demoRunning; renderJobs();")
+                page.wait_for_timeout(400)
+                page.locator("#accountCard").scroll_into_view_if_needed()
                 page.wait_for_timeout(300)
             elif click == "#aclDemo":
                 page.evaluate(DEMO_ACL)

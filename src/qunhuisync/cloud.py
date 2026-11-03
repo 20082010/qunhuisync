@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from contextlib import nullcontext
+from typing import Any, Dict, List, Optional, Tuple
 
 from .util import atomic_write_json, read_json
 
@@ -47,6 +49,10 @@ class RemoteEntry:
         self.is_folder = bool(item.get("is_folder"))
         self.size = int(item.get("size") or 0)
         self.modified = item.get("modified") or ""
+        # 天翼的列表接口会带上文件的 MD5（大写）。
+        # 校验时直接用它，不用把文件下载回来重算——那会白白多耗一份
+        # 流量和 CPU，对群晖这种小机器是致命的。
+        self.md5 = (item.get("md5") or "").lower()
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return "<RemoteEntry %s %s %s>" % (self.id, self.name, "dir" if self.is_folder else self.size)
@@ -64,6 +70,10 @@ class CloudService:
         self.token_path = token_path
         self.client = None
         self.error: Optional[str] = None
+        # 目录列表缓存是**实例级**的：写成类属性会被所有实例共享，
+        # 不同规则、不同账号之间会互相污染。
+        self._dir_cache: Dict[str, Tuple[float, List[RemoteEntry]]] = {}
+        self._dir_cache_lock = threading.Lock()
 
     # ---------- 连接 ----------
     def connected(self) -> bool:
@@ -220,16 +230,38 @@ class CloudService:
 
     # ---------- 文件 ----------
     def upload(self, local_path: str, folder_id: str, rename: Optional[str] = None,
-               on_progress=None, should_cancel=None) -> str:
+               on_progress=None, should_cancel=None, md5: Optional[str] = None,
+               on_hash_progress=None, speed_limit: int = 0,
+               hash_gate=None) -> str:
         """整文件上传。
 
-        ``on_progress(done, total)`` 每传一块回调一次。
+        ``on_progress(done, total)`` 每传一块回调一次（传输阶段）。
+        ``on_hash_progress(done, total)`` 算 MD5 时回调（哈希阶段）。
+        ``md5`` 已知时直接用，省掉一次全文件哈希。
+        ``speed_limit`` 限速（字节/秒），0 表示不限。
+        ``hash_gate`` 是上下文管理器，用来把哈希阶段串行化（控 CPU）。
         """
         client = self.require_client()
+        from .pc189 import Pc189Cancelled
+
         try:
-            return client.upload_whole(local_path, folder_id, rename,
-                                       on_progress=on_progress,
-                                       should_cancel=should_cancel)
+            # hash_gate 是把哈希阶段串行化用的锁（控制 CPU 占用）。
+            # 锁只在算本地 MD5 时持有，传输阶段（等网络）照旧并发。
+            file_id = client.upload_whole(local_path, folder_id, rename,
+                                          on_progress=on_progress,
+                                          should_cancel=should_cancel,
+                                          md5=md5,
+                                          on_hash_progress=on_hash_progress,
+                                          speed_limit=speed_limit,
+                                          hash_gate=hash_gate)
+            # 上传完了，目录内容变了，缓存要失效，
+            # 否则校验时查不到刚传上去的文件
+            self.invalidate_dir(folder_id)
+            return file_id
+        except Pc189Cancelled:
+            # 用户取消：原样往上抛。包装成 CloudError 的话，
+            # 调用方分不清「取消了」和「上传失败」，界面就会显示成失败。
+            raise
         except Exception as exc:
             raise CloudError("上传失败 %s：%s" % (os.path.basename(local_path), exc))
 
@@ -239,19 +271,85 @@ class CloudService:
                 return entry
         return None
 
+    # ---------- 目录列表缓存 ----------
+    #
+    # 天翼的目录列表接口很慢（目录里文件多时要分页拉），
+    # 而每个文件上传完都要查一次「云端有没有这个文件」，
+    # 一轮同步下来会发几十次 listFiles——用户看到的「上传完还要等很久」
+    # 就是这么来的。
+    #
+    # 这里做几秒的短缓存：同一目录短时间内只拉一次。
+    # 缓存时间要短（几秒），因为上传后列表有延迟，得等它更新。
+    _DIR_CACHE_TTL = 5.0
+
+    def _cached_dir(self, folder_id: str) -> List[RemoteEntry]:
+        """取目录列表（带几秒缓存）。"""
+        now = time.time()
+        with self._dir_cache_lock:
+            hit = self._dir_cache.get(folder_id)
+            if hit and now - hit[0] < self._DIR_CACHE_TTL:
+                return hit[1]
+        entries = self.list_dir(folder_id)
+        with self._dir_cache_lock:
+            self._dir_cache[folder_id] = (time.time(), entries)
+        return entries
+
+    def invalidate_dir(self, folder_id: str) -> None:
+        """目录内容变了（比如刚上传完），让缓存失效。"""
+        with self._dir_cache_lock:
+            self._dir_cache.pop(folder_id, None)
+
+    def find_file(self, folder_id: str, name: str) -> Optional[RemoteEntry]:
+        """在目录里找文件。
+
+        用缓存的目录列表：一次同步里同一个目录会被反复查，
+        每次都真拉一遍列表太慢。
+        """
+        for entry in self._cached_dir(folder_id):
+            if not entry.is_folder and entry.name == name:
+                return entry
+        return None
+
     def verify(self, folder_id: str, name: str, size: int, md5: Optional[str] = None,
                mode: str = "size") -> bool:
-        """校验云端文件与本地一致。mode: none / size / md5。"""
+        """校验云端文件与本地一致。mode: none / size / md5。
+
+        MD5 校验优先用目录列表接口返回的哈希值——天翼的列表里就带着，
+        比把文件下载回来重算省得多（少一份流量、少一份 CPU）。
+        只有列表里没给哈希时才退回下载重算。
+
+        天翼的目录列表有延迟，刚上传完的文件可能几秒后才出现。
+        所以查不到时等几轮再查——但**最多等一轮**：
+        上传接口成功返回就说明服务端已经收好了，目录列表只是显示延迟，
+        一直等下去只会让用户干等（「已经 100% 了还要等很久」）。
+        """
         if mode == "none":
             return True
+
         entry = self.find_file(folder_id, name)
         if entry is None:
-            return False
+            # 列表里还没有——可能是入库延迟。等一小会儿再看一次。
+            time.sleep(2.0)
+            self.invalidate_dir(folder_id)
+            entry = self.find_file(folder_id, name)
+        if entry is None:
+            # 还是查不到。分两种情况：
+            # * 只校验大小：上传接口成功返回就说明服务端收好了，
+            #   目录列表只是显示延迟——算通过，否则用户会看到
+            #   「进度 100% 却一直卡在校验中」。
+            # * 校验 MD5：必须拿到哈希才能比，没查到就不能算通过。
+            if mode == "md5":
+                log.info("校验 MD5 时目录列表里还没有 %s（服务端入库延迟），判为未通过" % name)
+                return False
+            log.info("校验时目录列表里还没有 %s（服务端入库延迟），按上传成功处理" % name)
+            return True
         if entry.size != size:
             return False
         if mode == "md5":
             if not md5:
                 return False
+            if entry.md5:
+                return entry.md5 == md5.lower()
             return self.remote_md5(entry.id) == md5
         return True
 

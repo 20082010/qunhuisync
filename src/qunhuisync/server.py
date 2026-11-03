@@ -341,9 +341,15 @@ def api_state(handler: Handler, match, params) -> None:
 
 def api_get_config(handler: Handler, match, params) -> None:
     config = handler.state.config
+    # 密码本身不回传（不往外泄），但要告诉前端「有没有设」，
+    # 否则前端读不到密码，用户清空输入框保存后，
+    # 不知道密码到底是被清掉了还是压根没读到。
+    server = dict(config.server)
+    server["has_password"] = bool((config.server.get("password") or "").strip())
+    server.pop("password", None)
     handler._json({
         "cloud": config.cloud,
-        "server": {"host": config.server.get("host"), "port": config.server.get("port")},
+        "server": server,
         "rules": [rule.to_dict() for rule in config.rules()],
     })
 

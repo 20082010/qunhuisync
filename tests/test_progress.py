@@ -131,7 +131,8 @@ class FakeCloud:
         return self.files.get((folder_id, name))
 
     def upload(self, local_path, folder_id, rename=None, on_progress=None,
-               should_cancel=None):
+               should_cancel=None, md5=None, on_hash_progress=None,
+               speed_limit=0, hash_gate=None):
         with self.lock:
             self.active += 1
             self.peak = max(self.peak, self.active)
@@ -246,7 +247,16 @@ def test_upload_threads_clamped(tmp_path):
     engine = SyncEngine(config, FakeCloud())
     assert engine.upload_threads() == 8
     config.set_cloud({"upload_threads": 0})
-    assert engine.upload_threads() == 3
+    assert engine.upload_threads() == 2, "没配置时默认 2（后台占用优先）"
+
+
+def test_speed_limit_read_from_config(tmp_path):
+    config = build_config(tmp_path)
+    config.set_cloud({"speed_limit": 1024 * 1024})
+    engine = SyncEngine(config, FakeCloud())
+    assert engine.speed_limit() == 1024 * 1024
+    config.set_cloud({"speed_limit": 0})
+    assert engine.speed_limit() == 0
 
 
 if __name__ == "__main__":

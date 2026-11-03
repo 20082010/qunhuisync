@@ -122,6 +122,14 @@ class Pc189NetworkError(Pc189Error):
     """网络层错误（连接被断开、超时等），通常重试就能成功。"""
 
 
+class Pc189Cancelled(Pc189Error):
+    """上传被用户取消。
+
+    单独一个类型，是为了让调用方能把它和**真正的失败**分开：
+    取消不是错误，不该在界面上显示「失败」，更不该触发重试。
+    """
+
+
 class AuthError(Pc189Error):
     """登录失败。"""
 
@@ -203,6 +211,212 @@ def _client_suffix() -> Dict[str, str]:
         "channelId": CHANNEL_ID,
         "rand": "%d_%d" % (int(time.time() * 1000) % 100000, int(time.time() * 1000) % 10000000000),
     }
+
+
+# 读文件算哈希时的分块大小。256KB 是内存与 IO 的平衡点：
+# 太小会让系统调用次数暴增，太大会占用不必要的内存。
+_HASH_BLOCK = 256 * 1024
+
+# 单次上传最多重试几次（断线后重传）
+_WHOLE_UPLOAD_RETRIES = 5
+
+# 单次 PUT 请求最多传多少字节。
+#
+# 实测（2026-11-03，真实网盘）：天翼的对象存储前端是 nginx，
+# **单个请求体超过 2GB 会被直接挡掉**，回 413 Request Entity Too Large，
+# 服务端一个字节都没收到（getUploadFileStatus 返回 0），
+# commit 再报 UploadFileStatusVerifyFailed。
+#
+# 所以大文件必须**分几次 PUT**，每次都小于这个上限。
+# 服务端会按 uploadFileId 把多次 PUT 的数据累加起来，
+# 每传完一段查一次 getUploadFileStatus，从服务端报的位置继续传。
+#
+# 取 900MB：留足余量（别贴着 2GB 的边），又不至于分太多次。
+_UPLOAD_CHUNK_SIZE = 900 * 1024 * 1024
+
+# 天翼网盘单文件大小上限：**问服务端**（见 `Pc189Client.max_file_size`）。
+#
+# 会员权益页写的是「普通用户 ≤2G，黄金会员 ≤200G，铂金会员不限」，
+# 同一个账号能不能传 4G 文件取决于它是什么会员，所以不能写死。
+# 写死 2G 会把黄金会员的大文件全拦下来，用户直接传不上去。
+
+# 上传用的读写超时（秒）。
+#
+# 大文件传完后，服务端还要落盘、拼装、校验才返回响应，这段时间可能很长。
+# 普通接口请求的 60 秒超时对上传来说太短——实测用户那边 1.3GB / 1.5GB /
+# 1.9GB 的文件全部报 ReadTimeout，就是等响应等超时了。
+#
+# 30 分钟足够传完几个 G 的文件（按 5MB/s 算，1.5GB 约 5 分钟）。
+_UPLOAD_TIMEOUT = 1800.0
+
+
+def human_bytes(num: float) -> str:
+    """字节数转可读字符串（用于错误信息）。"""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(num)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return "%.1f %s" % (size, unit)
+        size /= 1024
+    return "%.1f TB" % size
+
+
+def _file_md5_with_progress(path: str, on_progress=None, should_cancel=None) -> str:
+    """分块计算文件的 MD5，并回报进度。
+
+    **不能**用 ``hashlib.md5(open(path,'rb').read())``——那会把整个文件读进内存。
+    群晖 NAS 内存有限，几个 GB 的视频这么干会直接吃光内存触发 swap，
+    CPU 占用瞬间飙到 100%，整机变卡。
+
+    ``on_progress(done, total)`` 每读一块回调一次。哈希阶段在群晖上要花
+    好几秒（大文件几十秒），界面必须有进度，否则用户会以为卡死了。
+    ``on_progress`` 可以是 ``None``。
+
+    ``should_cancel`` 返回 True 时立刻放弃。**哈希阶段也必须能被取消**：
+    2GB 的文件在群晖上算 MD5 要几十秒，用户点「取消此文件」后
+    如果这里不查，就还得干等几十秒才停——用户看到的就是「取消没反应」。
+    """
+    import hashlib
+    import os
+
+    digest = hashlib.md5()
+    total = os.path.getsize(path)
+    done = 0
+    with open(path, "rb") as handle:
+        while True:
+            if should_cancel and should_cancel():
+                raise Pc189Cancelled("上传已取消")
+            block = handle.read(_HASH_BLOCK)
+            if not block:
+                break
+            digest.update(block)
+            done += len(block)
+            if on_progress:
+                on_progress(done, total)
+    return digest.hexdigest()
+
+
+class _CancellableLock:
+    """一把能被取消打断的锁。
+
+    哈希锁是全局的（多个上传线程共用），用来把 CPU 密集的哈希阶段
+    串行化。但直接 ``with lock:`` 有个问题：**排队等锁的线程没法响应取消**。
+
+    场景：三个大文件同时上传，线程 A 拿着锁在算哈希（几十秒），
+    线程 B、C 在等锁。这时候用户点「取消此文件」——
+    B、C 还在 ``lock.acquire()`` 里睡着，根本看不到取消标志，
+    得等 A 算完才轮到自己，然后才开始查取消、又白算一遍。
+
+    这里改成**带超时的轮询获取**：每次等一小会儿就醒来查一次取消标志，
+    取消了就立刻退出，不用等别人。
+    """
+
+    def __init__(self, lock, should_cancel=None):
+        self._lock = lock
+        self._should_cancel = should_cancel
+
+    def __enter__(self):
+        while True:
+            if self._should_cancel and self._should_cancel():
+                raise Pc189Cancelled("上传已取消")
+            # 最多等 0.2 秒就醒一次看取消标志
+            if self._lock.acquire(timeout=0.2):
+                return self._lock
+            # 没拿到就继续转，检查取消
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            self._lock.release()
+        except RuntimeError:
+            pass
+        return False
+
+
+def lower_priority(nice_delta: int = 10) -> bool:
+    """降低当前线程的 CPU 优先级。
+
+    群晖是共享机器：把 CPU 吃满时，用户连 DSM 界面都点不动、
+    其它服务也会被拖慢。上传是后台任务，优先级理应低于前台。
+
+    ``nice`` 值越大优先级越低（Linux 默认 0，19 是最低）。
+    在 Linux 上 ``os.nice`` 只影响**调用它的那个线程**，正好用在
+    上传工作线程上，主线程照常响应界面。
+
+    返回是否成功降级（Windows 等平台不支持）。
+    """
+    import os
+
+    if not hasattr(os, "nice"):
+        return False
+    try:
+        os.nice(nice_delta)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+class _RateLimiter:
+    """上传限速器（令牌桶的简化版）。
+
+    群晖 CPU 被打满时整机会很卡，连 DSM 界面都点不动。上传本身是 IO 密集的，
+    真正吃 CPU 的是 TLS 加密和本地哈希，把速率压下来 CPU 占用就跟着降。
+
+    用法：每发一块调用一次 :meth:`tick`，它会按需 ``sleep``，
+    让平均速度不超过 ``bytes_per_second``。
+    """
+
+    def __init__(self, bytes_per_second: int):
+        self.rate = max(0, int(bytes_per_second))
+        self.started = 0.0
+        self.count = 0
+
+    def tick(self, nbytes: int) -> None:
+        """记一次已发送字节，必要时等待。"""
+        if self.rate <= 0:
+            return
+        import time as _time
+        now = _time.monotonic()
+        if not self.started:
+            self.started = now
+        self.count += nbytes
+        expected = self.count / float(self.rate)
+        elapsed = now - self.started
+        delay = expected - elapsed
+        if delay > 0:
+            _time.sleep(min(delay, 10.0))
+
+
+def _parse_put_error(resp) -> Optional[str]:
+    """从 PUT 响应里解析错误。
+
+    天翼的 PUT 响应有个坑：**HTTP 200 但响应体是 XML 错误**，
+    光看状态码会以为上传成功了。
+
+    实测的错误码：
+    * ``InputStreamReadError`` —— 这次 PUT 没传完（分块上传时正常）
+    * ``UploadFileCompeletedError`` —— 服务端收到的字节数与声明的 size 不符
+      （文件超过账号的 2G 上限时就是它：服务端截断了上传）
+    * ``SaveFileError`` —— 保存失败（文件名带 emoji 等）
+
+    返回 None 表示这次 PUT 成功。
+    """
+    text = resp.text or ""
+    if not text.strip().startswith("<"):
+        return None
+    code_match = re.search(r"<code>(.*?)</code>", text)
+    code = code_match.group(1) if code_match else ""
+    if not code:
+        return None
+
+    # 特殊处理：服务端收到的字节数不够，通常是文件太大被截断。
+    if code == "UploadFileCompeletedError":
+        return ("服务端只收到部分数据就结束了——文件很可能超过账号的单文件上限"
+                "（普通用户 2G），或服务端空间不足")
+
+    message_match = re.search(r"<message>(.*?)</message>", text, re.S)
+    message = message_match.group(1) if message_match else ""
+    # 消息里带 requestId/sessionKey 等噪音，只保留前 200 字符
+    return "%s：%s" % (code, message[:200])
 
 
 def _response_error(data: Any) -> Optional[str]:
@@ -659,17 +873,75 @@ class Pc189Client:
         self.username = session_data.get("loginName") or ""
         if not self.session_key or not self.session_secret:
             raise Pc189Error("会话信息不完整，请重新登录")
+        self.timeout = timeout
         self.http = httpx.Client(
             follow_redirects=True,
             timeout=timeout,
             headers={"User-Agent": USER_AGENT, "Accept": "application/json;charset=UTF-8"},
         )
+        # 账号的单文件上限（字节）。服务端说了算，查一次就缓存住。
+        self._max_file_size: Optional[int] = None
+
+    def max_file_size(self) -> Optional[int]:
+        """账号的单文件上传上限（字节）；查不到返回 None。
+
+        天翼按会员等级给不同的额度（普通用户 2G、黄金会员 200G、
+        铂金会员不限），所以**不能写死一个值**——写死会把黄金会员的
+        4G 文件全拦下来，用户根本传不上去。
+
+        额度由服务端在 ``getUserInfo.action`` 的 ``maxFilesize`` 里给出。
+
+        **查不到时返回 None，而不是退回 2G。**
+        这个接口偶尔会返回 ``InvalidSessionKey / sessionSignatureCheck error``
+        （实测同一秒内有时成功有时失败）。如果这时候退回 2G，
+        就会把服务端明明允许的大文件**误判成超限**给拦下来——
+        用户看到的就是「我的 4G 文件传不上去」，比不拦更糟。
+        拿不准就不拦，交给服务端自己判断（它超限了会明确报错）。
+        """
+        if self._max_file_size is not None:
+            return self._max_file_size or None
+        size = 0
+        # 这个接口不稳定，重试两次。
+        for attempt in range(3):
+            try:
+                data = self.request(API_URL + "/getUserInfo.action", "GET")
+                size = int(data.get("maxFilesize") or 0)
+                if size > 0:
+                    break
+            except Exception:
+                time.sleep(0.5)
+                continue
+        self._max_file_size = size
+        return size or None
 
     def close(self) -> None:
         try:
             self.http.close()
         except Exception:
             pass
+
+    def _upload_timeout(self) -> httpx.Timeout:
+        """上传用的超时配置。
+
+        为什么要单独一套：
+
+        * **read 超时**——PUT 传完整个文件后，服务端还要落盘、拼装、校验，
+          这段时间可能很长。1GB 以上的文件传完再等响应，很容易超过
+          普通请求的 60 秒，于是报 ``ReadTimeout``（实测用户那边
+          1.3GB / 1.5GB / 1.9GB 的文件全是这个错）。
+        * **write 超时**——每次往 socket 写都要在超时内完成。对端读取慢
+          时单次写操作可能卡很久，所以也要放宽。
+        * **connect 超时**——建连接就该快，超时就直接失败，不用等。
+
+        这里给上传单独放宽，普通接口调用仍用原来的短超时
+        （接口卡住时快速失败，界面才有反应）。
+        """
+        return httpx.Timeout(
+            connect=self.timeout,
+            read=_UPLOAD_TIMEOUT,
+            write=_UPLOAD_TIMEOUT,
+            pool=self.timeout,
+        )
 
     def _aes_key(self) -> str:
         """AES 加密用的 key：sessionSecret 的前 16 个字符。
@@ -892,7 +1164,9 @@ class Pc189Client:
 
     def upload_whole(self, local_path: str, folder_id: str,
                      rename: Optional[str] = None, on_progress=None,
-                     should_cancel=None) -> str:
+                     should_cancel=None, md5: Optional[str] = None,
+                     on_hash_progress=None, speed_limit: int = 0,
+                     hash_gate=None) -> str:
         """整文件上传（OpenList 的 ``OldUpload`` 机制）。
 
         与分片上传不同，这里**一次性 PUT 整个文件**，天翼自己断点续传：
@@ -902,16 +1176,50 @@ class Pc189Client:
         3. ``getUploadFileStatus.action`` -> 查已传字节，不足则续传
         4. POST ``fileCommitUrl`` -> 提交，得到文件 id
 
-        ``on_progress(done, total)`` 每传一块回调一次。
+        ``on_progress(done, total)`` 每传一块回调一次（传输阶段）。
+        ``on_hash_progress(done, total)`` 算 MD5 时回调（哈希阶段）。
+        ``md5`` 已知时直接用，省掉一次全文件哈希。
+        ``speed_limit`` 是限速（字节/秒），0 表示不限。
+        ``hash_gate`` 是锁，只在算 MD5 时持有（把哈希阶段串行化，控 CPU）。
         """
-        import hashlib
         import os
 
         file_size = os.path.getsize(local_path)
         name = rename or os.path.basename(local_path)
 
-        with open(local_path, "rb") as handle:
-            file_md5 = hashlib.md5(handle.read()).hexdigest()
+        # 天翼按会员等级给不同的单文件额度（普通用户 2G、黄金会员 200G、
+        # 铂金会员不限），所以上限要**问服务端**，不能写死——
+        # 写死 2G 会把黄金会员的 4G 文件全拦下来，用户根本传不上去。
+        #
+        # 超过上限时服务端会**截断**上传，PUT 返回
+        # UploadFileCompeletedError，commit 再报 SaveFileError——
+        # 表现就是「同一个文件反复上传」。这里提前拦下来，
+        # 免得白传几个 G 再失败。
+        #
+        # 查不到上限时**不拦**：宁可让服务端自己判断（它超限了会明确报错），
+        # 也不能因为一次查询失败就把用户能传的文件误拦下来。
+        max_size = self.max_file_size()
+        if max_size and file_size > max_size:
+            raise Pc189Error(
+                "文件 %s（%s）超过当前账号的天翼网盘单文件上限 %s。"
+                "需要开通黄金会员（≤200G）才能上传更大的文件。"
+                % (name, human_bytes(file_size), human_bytes(max_size)))
+
+        # 分块算 MD5：整个文件读进内存会让 NAS 内存爆掉、CPU 打满，
+        # 几个 GB 的视频尤其明显。已经有 md5 就别再算一遍。
+        #
+        # 哈希阶段持锁：本地算 MD5 是纯 CPU 活，多个线程同时算就是
+        # 多个核一起烧，群晖 CPU 直接 100%。传输阶段不持锁，照旧并发。
+        if md5:
+            file_md5 = md5
+        elif hash_gate is not None:
+            # 用可取消的锁：排队等锁时也能响应「取消此文件」。
+            with _CancellableLock(hash_gate, should_cancel):
+                file_md5 = _file_md5_with_progress(local_path, on_hash_progress,
+                                                   should_cancel)
+        else:
+            file_md5 = _file_md5_with_progress(local_path, on_hash_progress,
+                                               should_cancel)
 
         create_url = API_URL + "/createUploadFile.action"
         info = self._post_form(create_url, {
@@ -935,67 +1243,163 @@ class Pc189Client:
             return self._commit_whole(commit_url, upload_id)
 
         sent = {"value": 0}
+        limiter = _RateLimiter(speed_limit)
 
-        def body_stream(offset: int):
-            """从 ``offset`` 开始读文件，边读边上报进度。"""
+        def body_stream(offset: int, length: int):
+            """从 ``offset`` 开始读 ``length`` 字节，边读边上报进度。
+
+            **每读一块都检查取消**：用户点「取消此文件」后要立刻停下来，
+            不能等整个文件传完才生效（大文件要传好几分钟）。
+            取消时抛 :class:`Pc189Cancelled`，httpx 会中断这次请求。
+            """
             with open(local_path, "rb") as handle:
                 handle.seek(offset)
-                while True:
-                    piece = handle.read(256 * 1024)
+                remaining = length
+                while remaining > 0:
+                    if should_cancel and should_cancel():
+                        raise Pc189Cancelled("上传已取消")
+                    piece = handle.read(min(256 * 1024, remaining))
                     if not piece:
                         break
+                    remaining -= len(piece)
                     yield piece
                     sent["value"] += len(piece)
                     if on_progress:
                         on_progress(offset + sent["value"], file_size)
+                    limiter.tick(len(piece))
 
         put_headers = self._signed("PUT", upload_url, {
             "ResumePolicy": "1",
-            "Expect": "100-continue",
             "Edrive-UploadFileId": str(upload_id),
             "Accept": "*/*",
         })
 
-        # 已经传了多少字节（断线后续传从这里开始）
+        # ---- 分段上传（多次 PUT，服务端累加）----
+        #
+        # 实测结论（2026-11-03，真实网盘验证）：
+        #
+        # 1. **单次 PUT 不能超过 2GB**。天翼的对象存储前端是 nginx，
+        #    超过就回 413 Request Entity Too Large，服务端**一个字节都没收到**
+        #    （getUploadFileStatus 返回 0）。之前的老代码把 4xx 当成
+        #    「网络断了」重传，于是同一个文件反复上传——就是用户报的 bug。
+        #
+        # 2. **但分多次 PUT 是能累加的**。同一个 uploadFileId，先传 1.2GB
+        #    -> 服务端登记 40.7%；再从服务端报的位置接着传 -> 继续涨。
+        #    最后 commit 成功。（对应 OpenList 的 OldUpload 逻辑。）
+        #
+        # 3. 服务端每收一段就回 ``InputStreamReadError``（HTTP 600），
+        #    意思是「我收到的还不够」——这是**正常的**，不是失败。
+        #
+        # 所以流程是：查服务端进度 -> 从那儿继续 PUT -> 再查 -> 直到传完。
         offset = 0
         last = ""
-        for attempt in range(5):
+        # 连续几轮没有进展才算失败。**不能拿轮数当失败次数**：
+        # 200GB 的文件要传 200 多段，每段都是正常的一轮。
+        stalls = 0
+        rounds = 0
+        max_rounds = file_size // _UPLOAD_CHUNK_SIZE + 20
+        while offset < file_size:
             if should_cancel and should_cancel():
-                raise Pc189Error("上传已取消")
-            remaining = file_size - offset
-            if remaining <= 0:
-                break
+                raise Pc189Cancelled("上传已取消")
+            rounds += 1
+            if rounds > max_rounds:
+                raise Pc189NetworkError(
+                    "上传失败：传了 %d 段仍没传完（已传 %s / %s）"
+                    % (rounds, human_bytes(offset), human_bytes(file_size)))
+
+            length = min(_UPLOAD_CHUNK_SIZE, file_size - offset)
             headers = dict(put_headers)
-            headers["Content-Length"] = str(remaining)
+            headers["Content-Length"] = str(length)
             sent["value"] = 0
             try:
+                # 上传要用宽松的超时：大文件传完后服务端还要处理，
+                # 普通请求的 60 秒读超时会让 1GB 以上的文件全部失败。
                 resp = self.http.put(upload_url, headers=headers,
-                                     content=body_stream(offset))
+                                     content=body_stream(offset, length),
+                                     timeout=self._upload_timeout())
+            except Pc189Cancelled:
+                # 用户取消：**不能当成网络错误重传**，直接往上抛。
+                raise
             except httpx.TransportError as exc:
+                # 网络层问题（断线、超时）。断线时已经发出去的那部分
+                # 服务端可能没收全，下面查状态后会从它报的位置继续。
                 last = "%s: %s" % (type(exc).__name__, exc)
                 log.warning("上传连接中断：%s", last)
             else:
-                if resp.status_code < 400:
-                    offset = file_size
-                    break
-                last = "HTTP %s" % resp.status_code
-                log.warning("上传返回 %s", last)
+                # 先看 HTTP 状态码。4xx/5xx 是服务端**明确拒绝**，
+                # 光看响应体不够——有些错误只回状态码，body 是空的。
+                status = int(getattr(resp, "status_code", 200) or 200)
+                if status == 413:
+                    # 413 = 请求体太大。实测天翼的对象存储前端
+                    # （nginx）只收 2GB 以内的请求体，传更大的会
+                    # 被挡掉——但**重传多少次都没用**，只会让用户
+                    # 看到同一个文件反复上传。
+                    raise Pc189Error(
+                        "文件 %s（%s）太大：天翼的单次上传请求不能超过 2GB，"
+                        "服务端直接拒绝了（HTTP 413）。"
+                        % (name, human_bytes(file_size)))
+                if 400 <= status < 500:
+                    # 4xx：权限/参数/配额问题，重传多少次都没用。
+                    raise Pc189Error(
+                        "上传被服务端拒绝：HTTP %d %s"
+                        % (status, (_parse_put_error(resp) or "")))
+                if status >= 500 and status != 600:
+                    # 5xx：服务端临时故障，可以重传。
+                    last = "HTTP %d" % status
+                    log.warning("上传返回 %s，准备重传", last)
+                else:
+                    # 天翼的 PUT 返回**HTTP 200 但响应体是 XML 错误**的情况很多，
+                    # 所以不能只看状态码，必须查响应体。
+                    put_error = _parse_put_error(resp)
+                    if put_error and "InputStreamReadError" not in put_error:
+                        # 服务端**明确拒绝**了。重传多少次都没用——
+                        # 只会让用户看到「同一个文件反复上传」。
+                        raise Pc189Error("上传被服务端拒绝：%s" % put_error)
 
-            # 查服务端实际收到多少，从断点继续
-            try:
-                status = self._upload_status(upload_id)
-                offset = int(status.get("size") or 0)
-            except Pc189Error:
-                offset = 0
-            if offset >= file_size:
-                break
-            time.sleep(1 + attempt)
+            # 服务端登记了多少？这是续传的依据。
+            #
+            # 实测：服务端登记的字节数会比实际收到的**略少一点**
+            # （它按 MiB 记账，最后一段收完才补齐），
+            # 所以必须以它报的位置为准，不能用本地计数。
+            registered = self._registered_size(upload_id)
+            if registered <= offset:
+                # 这一轮没有进展。
+                stalls += 1
+                if stalls > _WHOLE_UPLOAD_RETRIES:
+                    raise Pc189NetworkError(
+                        "上传失败：已重试 %d 次仍没有进展"
+                        "（服务端已收 %s / %s 字节，本次已发 %s 字节）"
+                        % (_WHOLE_UPLOAD_RETRIES, human_bytes(offset),
+                           human_bytes(file_size), human_bytes(sent["value"])))
+                log.warning("上传没有进展（登记 %d / 期望 %d），重试",
+                            registered, offset)
+                time.sleep(min(stalls, 5))
+                continue
+
+            stalls = 0
+            offset = registered
+            if on_progress:
+                on_progress(offset, file_size)
 
         if offset < file_size:
-            raise Pc189NetworkError("上传失败：%s（已传 %d/%d 字节）"
-                                    % (last or "连接中断", offset, file_size))
+            # 报两个数：**服务端登记了多少**（真正传上去的、还能续传的位置）
+            # 和**本次发了多少**（本地计数）。只报一个会让人误判进度。
+            raise Pc189NetworkError(
+                "上传失败：%s（服务端已收 %s / %s 字节，本次已发 %s 字节）"
+                % (last or "连接中断",
+                   human_bytes(offset),
+                   human_bytes(file_size),
+                   human_bytes(sent["value"])))
 
         return self._commit_whole(commit_url, upload_id)
+
+    def _registered_size(self, upload_id: Any) -> int:
+        """问服务端：这个上传已经登记了多少字节。"""
+        try:
+            status = self._upload_status(upload_id)
+            return int(status.get("size") or 0)
+        except Pc189Error:
+            return 0
 
     def _upload_status(self, upload_id: Any) -> Dict[str, Any]:
         """查上传进度（已传字节数在 ``size`` 里）。"""
@@ -1022,7 +1426,15 @@ class Pc189Client:
             match = re.search(r"<id>(\d+)</id>", result)
             if match:
                 return match.group(1)
-            raise Pc189Error("提交上传失败：%s" % (_parse_response_error(result) or "未知错误"))
+            error = _parse_response_error(result) or "未知错误"
+            # 给常见原因加一句人话，省得用户自己猜
+            if "UploadFileStatusVerifyFailed" in error:
+                extra = "（服务端没收到完整数据，可能文件过大被截断）"
+            elif "SaveFileError" in error:
+                extra = "（保存失败，常见于文件名含特殊字符或空间不足）"
+            else:
+                extra = ""
+            raise Pc189Error("提交上传失败%s：%s" % (extra, error[:300]))
         file_info = result.get("file") or {}
         return str(file_info.get("userFileId") or file_info.get("id") or "")
 
@@ -1186,27 +1598,15 @@ class Pc189Client:
             return self._commit_upload(upload_file_id, "", "", file_size)
 
         count = int(math.ceil(file_size / float(slice_size))) if file_size else 1
-
-        # 先把每个分片的 MD5 算出来，同时读一遍文件算整文件 MD5
-        slice_md5s: List[str] = []
-        chunks: List[bytes] = []
-        file_md5 = hashlib.md5()
-        with open(local_path, "rb") as handle:
-            for _ in range(count):
-                chunk = handle.read(slice_size)
-                if not chunk:
-                    break
-                file_md5.update(chunk)
-                slice_md5s.append(hashlib.md5(chunk).hexdigest().upper())
-                chunks.append(chunk)
-
-        total_parts = len(chunks)
-        if total_parts == 0:
-            raise Pc189Error("文件为空，无法上传")
+        total_parts = count
 
         # 每个分片已传字节数
         part_done: Dict[int, int] = {}
         done_lock = threading.Lock()
+        # 整体 MD5 在传输过程中顺便算出来（不用再读一遍文件）
+        file_digest = hashlib.md5()
+        # 各分片的 MD5（提交时要用来算 sliceMd5）
+        slice_md5s: Dict[int, str] = {}
 
         def report(index: int, amount: int) -> None:
             """分片内每传完一块就上报一次，让进度条走得更细。
@@ -1221,9 +1621,27 @@ class Pc189Client:
                 on_progress(total)
 
         def upload_part(index: int) -> None:
-            chunk = chunks[index - 1]
-            digest = hashlib.md5(chunk).digest()
-            part_info = "%d-%s" % (index, base64.b64encode(digest).decode())
+            """上传第 index 片（1 起）。
+
+            **流式**：每次只把这片的字节读进内存，算完 MD5 立刻发出去。
+            整个文件从头到尾不会被完整读进内存——群晖内存有限，
+            几个 GB 的视频这么干会直接触发 swap，CPU 打满整机卡死。
+            """
+            offset = (index - 1) * slice_size
+            length = min(slice_size, file_size - offset)
+            with open(local_path, "rb") as handle:
+                handle.seek(offset)
+                data = handle.read(length)
+            if not data:
+                raise Pc189Error("第 %d 片读取失败" % index)
+
+            digest = hashlib.md5(data).hexdigest().upper()
+            with done_lock:
+                slice_md5s[index] = digest
+                file_digest.update(data)
+
+            part_info = "%d-%s" % (index, base64.b64encode(
+                hashlib.md5(data).digest()).decode())
 
             def send() -> None:
                 urls = self.request(
@@ -1236,7 +1654,7 @@ class Pc189Client:
                 if not target:
                     raise Pc189Error("获取上传地址失败：%s" % (urls.get("msg") or "未知错误"))
                 headers = self._parse_upload_headers(target.get("requestHeader") or "")
-                self._put_chunk(target["requestURL"], headers, chunk,
+                self._put_chunk(target["requestURL"], headers, data,
                                 on_sent=lambda n: report(index, n))
 
             self._retry(send, "上传第 %d 片" % index)
@@ -1253,11 +1671,12 @@ class Pc189Client:
                     raise Pc189Error("上传已取消")
                 upload_part(index)
 
-        file_md5_hex = file_md5.hexdigest().upper()
+        file_md5_hex = file_digest.hexdigest().upper()
         slice_md5_hex = file_md5_hex
         if file_size > slice_size:
             slice_md5_hex = hashlib.md5(
-                "\n".join(slice_md5s).encode("utf-8")).hexdigest().upper()
+                "\n".join(slice_md5s[i] for i in sorted(slice_md5s)).encode("utf-8")
+            ).hexdigest().upper()
         return self._commit_upload(upload_file_id, file_md5_hex, slice_md5_hex, file_size)
 
     def _commit_upload(self, upload_file_id: str, file_md5: str, slice_md5: str,

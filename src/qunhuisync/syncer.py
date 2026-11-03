@@ -5,13 +5,15 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .cloud import CloudError, CloudService
 from .config import Config, Rule
+from .pc189 import Pc189Cancelled, _CancellableLock, _file_md5_with_progress
 from .scanner import LocalFile, scan
-from .util import file_md5, human_size
+from .util import human_size, sanitize_remote_name
 
 log = logging.getLogger("qunhuisync.sync")
 
@@ -57,6 +59,8 @@ class SyncJob:
             self._active_files[rel_path] = {
                 "size": size, "done": 0, "started_at": now,
                 "last_at": now, "last_done": 0, "speed": 0.0,
+                # 哈希阶段进度（本地算 MD5 时用）
+                "hash_done": 0, "hash_size": 0, "hashing": False,
             }
 
     def update_file(self, rel_path: str, done: int, total: int = 0) -> None:
@@ -77,6 +81,23 @@ class SyncJob:
                 entry["last_at"] = now
                 entry["last_done"] = done
             entry["done"] = done
+            # 进入传输阶段后就不再显示哈希进度
+            entry["hashing"] = False
+
+    def update_hash(self, rel_path: str, done: int, total: int = 0) -> None:
+        """更新某个文件的哈希（本地算 MD5）进度。
+
+        哈希是 CPU 密集阶段，大文件在群晖上要算好几秒。
+        不显示的话用户会以为上传卡死了。
+        """
+        with self._counter_lock:
+            entry = self._active_files.get(rel_path)
+            if not entry:
+                return
+            entry["hashing"] = True
+            entry["hash_done"] = done
+            if total:
+                entry["hash_size"] = total
 
     def end_file(self, rel_path: str) -> None:
         """文件处理完毕。"""
@@ -107,6 +128,8 @@ class SyncJob:
         for path, entry in items:
             size = int(entry["size"])
             done = int(entry["done"])
+            hash_size = int(entry.get("hash_size") or 0)
+            hash_done = int(entry.get("hash_done") or 0)
             result.append({
                 "path": path,
                 "name": os.path.basename(path),
@@ -116,6 +139,11 @@ class SyncJob:
                 "percent": int(done * 100 / size) if size else 0,
                 "cancelled": bool(entry.get("cancelled")),
                 "elapsed": max(0.0, time.time() - entry["started_at"]),
+                # 哈希阶段（本地算 MD5）：界面单独显示，别让用户以为卡死
+                "hashing": bool(entry.get("hashing")),
+                "hash_done": hash_done,
+                "hash_size": hash_size,
+                "hash_percent": int(hash_done * 100 / hash_size) if hash_size else 0,
             })
         return result
 
@@ -228,7 +256,7 @@ class SyncEngine:
         if job is None:
             return False
         job.request_cancel()
-        job.log("收到取消请求，当前文件处理完后停止")
+        job.log("收到取消请求，正在停止上传")
         return True
 
     def cancel_file(self, rule_id: str, rel_path: str) -> bool:
@@ -246,14 +274,28 @@ class SyncEngine:
     def upload_threads(self) -> int:
         """同时上传的文件数。
 
-        线程数太多对天翼不友好（容易触发限流），太少又慢，这里默认 3，
+        这是**唯一**控制后台资源占用的旋钮：线程越多，传得越快，
+        但占用的 CPU 和带宽也越多。默认 2 是「速度和占用」的平衡点，
         可在账号设置里调整，范围 1-8。
+
+        另外后台占用已经做了三重保护，不需要用户再设数值：
+        * 本地算 MD5 是纯 CPU 活，**哈希阶段自动串行**，不会多核满载
+        * 上传线程**自动降优先级**（nice），前台 DSM 界面永远优先
+        * 上传限速（``speed_limit``）可以进一步压低后台占用
         """
         try:
-            value = int(self.config.cloud.get("upload_threads") or 3)
+            value = int(self.config.cloud.get("upload_threads") or 2)
         except (TypeError, ValueError):
-            value = 3
+            value = 2
         return max(1, min(8, value))
+
+    def speed_limit(self) -> int:
+        """上传限速（字节/秒），0 表示不限速。"""
+        try:
+            value = int(self.config.cloud.get("speed_limit") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return max(0, value)
 
     # ---------- 主流程 ----------
     def run(self, rule: Rule, job: SyncJob) -> SyncJob:
@@ -370,6 +412,10 @@ class SyncEngine:
         def worker(item: LocalFile) -> None:
             if job.cancelled:
                 return
+            # 上传线程降优先级：群晖是共享机器，上传是后台任务，
+            # 优先级应该低于前台，这样 CPU 再忙 DSM 界面也不卡。
+            from .pc189 import lower_priority
+            lower_priority(10)
             with index_lock:
                 counter["index"] += 1
                 job.set_progress("current_index", counter["index"])
@@ -386,6 +432,15 @@ class SyncEngine:
 
         with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="qhs-up") as pool:
             list(pool.map(worker, pending))
+
+    # ---------- 哈希阶段 ----------
+    #
+    # 本地算 MD5 是纯 CPU 活。三个线程同时算三个大文件，就是三个核
+    # 一起烧——群晖 CPU 直接 100%，整机卡得连 DSM 界面都点不动。
+    #
+    # 传输阶段是 IO 密集的（等网络），不费 CPU。所以正确的做法是
+    # **哈希串行、传输并发**：CPU 峰值被压在 1 个核，网络吞吐不受影响。
+    _hash_lock = threading.Lock()
 
     def _sync_one(self, rule: Rule, job: SyncJob, item: LocalFile, remote_dir_for,
                   rule_state: Dict[str, Dict], state_lock: Optional[threading.Lock] = None) -> None:
@@ -421,6 +476,13 @@ class SyncEngine:
         else:
             target_name = os.path.basename(item.path)
 
+        # 天翼网盘存不了带 emoji 的文件名（实测必定报 SaveFileError，
+        # 重试也没用），所以上传前把 emoji 换成下划线。
+        safe_name = sanitize_remote_name(target_name)
+        if safe_name != target_name:
+            job.log("文件名含 emoji，已在云端改名为：%s" % safe_name)
+            target_name = safe_name
+
         try:
             folder_id = remote_dir_for(target_dir)
         except CloudError as exc:
@@ -442,6 +504,9 @@ class SyncEngine:
         if existing is not None and rule.overwrite:
             try:
                 self.cloud.delete_remote(existing.id, existing.name)
+                # 删了云端文件，目录列表缓存要失效，
+                # 否则后面查到的还是刚删掉的那个
+                self.cloud.invalidate_dir(folder_id)
                 job.log("覆盖远端同名文件：%s" % target_name)
             except CloudError as exc:
                 job.bump('failed')
@@ -449,25 +514,59 @@ class SyncEngine:
                 return
 
         local_md5 = None
-        if rule.verify_mode == "md5":
-            try:
-                local_md5 = file_md5(item.path)
-            except OSError as exc:
-                job.log("计算本地 MD5 失败：%s" % exc)
+        need_md5 = rule.verify_mode == "md5"
 
         def on_progress(done: int, total: int = 0) -> None:
             """上传进度回调。"""
             job.update_file(item.rel_path, done, total)
 
+        def on_hash_progress(done: int, total: int = 0) -> None:
+            """哈希阶段进度回调。
+
+            哈希阶段不算进上传进度里（那是两个不同的阶段），
+            但界面要显示出来，否则大文件算哈希时看起来像卡死。
+            """
+            job.update_hash(item.rel_path, done, total)
+
         def should_cancel() -> bool:
             """整个任务取消，或这个文件单独被取消。"""
             return job.cancelled or job.file_cancelled(item.rel_path)
 
+        if need_md5:
+            # 算 MD5 也要能被取消、也要走同一把锁：
+            # * 不走锁的话，这里算一遍、upload_whole 里又算一遍（或者
+            #   两个线程同时算），CPU 直接翻倍——正是要避免的。
+            # * 不查取消的话，用户在哈希阶段点「取消此文件」没反应，
+            #   2GB 的文件要干等几十秒才停。
+            try:
+                with _CancellableLock(self._hash_lock, should_cancel):
+                    local_md5 = _file_md5_with_progress(
+                        item.path, on_hash_progress, should_cancel)
+            except OSError as exc:
+                job.log("计算本地 MD5 失败：%s" % exc)
+
         try:
-            self.cloud.upload(item.path, folder_id, None, on_progress,
-                              should_cancel=should_cancel)
+            # 上传和校验共用同一个 MD5：以前这里算一遍、上传时又算一遍，
+            # 大文件等于把整个文件读两遍、哈希两遍，CPU 直接翻倍。
+            #
+            # 哈希阶段还要**全局串行**：本地 MD5 是纯 CPU 活，三个线程
+            # 同时算三个大文件就是三个核一起烧，群晖 CPU 直接 100%。
+            # 串行后 CPU 峰值压在 1 个核，而传输阶段（等网络）照旧并发。
+            #
+            # rename 必须传 target_name（改名后的），否则云端会用
+            # 原始文件名——带 emoji 的名字传上去必然 SaveFileError。
+            self.cloud.upload(item.path, folder_id, target_name, on_progress,
+                              should_cancel=should_cancel,
+                              md5=local_md5,
+                              on_hash_progress=on_hash_progress,
+                              speed_limit=self.speed_limit(),
+                              hash_gate=self._hash_lock)
+        except Pc189Cancelled:
+            # 用户取消：不是失败，不该在界面上显示「失败」。
+            job.log("已取消上传 %s" % item.rel_path)
+            return
         except CloudError as exc:
-            if job.file_cancelled(item.rel_path):
+            if job.cancelled or job.file_cancelled(item.rel_path):
                 job.log("已取消上传 %s" % item.rel_path)
                 return
             job.bump('failed')

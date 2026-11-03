@@ -5,6 +5,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from typing import Iterable
@@ -55,6 +56,44 @@ def file_md5(path: str, chunk_size: int = 1024 * 1024) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# 天翼网盘不接受文件名里的 emoji（4 字节的字符，比如 ������）。
+#
+# 实测：文件名里只要有任何一个 emoji，commit 阶段必定报
+# ``SaveFileError``，而且重试多少次都没用（PUT 阶段是成功的，
+# 是保存的时候失败）。中文、日文、全角引号、@、#、超长名（200 字符）
+# 都正常，只有 emoji 不行。
+#
+# 所以上传前把 emoji 换成下划线，保证文件能传上去。
+_EMOJI_PATTERN = re.compile(
+    "[" "\U0001F000-\U0001FAFF"      # 各类 emoji 图形
+    "\U00002600-\U000027BF"          # 杂项符号与箭头
+    "\U0001F1E6-\U0001F1FF"          # 地区指示符号
+    "\U0000FE0F"                     # 变体选择符
+    "\U0001F3FB-\U0001F3FF"          # 肤色修饰
+    "]"
+)
+
+
+def has_emoji(name: str) -> bool:
+    """文件名里是否含 emoji。"""
+    return bool(_EMOJI_PATTERN.search(name or ""))
+
+
+def sanitize_remote_name(name: str) -> str:
+    """把文件名里的 emoji 换成下划线。
+
+    天翼网盘存不了带 emoji 的文件名（实测必报 SaveFileError），
+    所以上传前先替换掉，保证文件能传上去。
+
+    只动 emoji，其余字符（中文、日文、标点）原样保留。
+    """
+    if not name:
+        return name
+    cleaned = _EMOJI_PATTERN.sub("_", name)
+    # 万一替换后变成空名字，给个兜底
+    return cleaned or "unnamed"
 
 
 def ensure_dir(path: str) -> str:

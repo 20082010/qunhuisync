@@ -199,6 +199,10 @@ pre.logs {
   background: linear-gradient(90deg, #4c8dff, #760e50);
   transition: width .25s ease;
 }
+/* 哈希阶段用另一种颜色，跟「正在上传」区分开 */
+.progress-bar.hash {
+  background: linear-gradient(90deg, #ffb454, #ff7b3d);
+}
 .progress-foot {
   display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap;
 }

@@ -59,7 +59,8 @@ class FakeCloud:
         return self.files.get((folder_id, name))
 
     def upload(self, local_path, folder_id, rename=None, on_progress=None,
-               should_cancel=None):
+               should_cancel=None, md5=None, on_hash_progress=None,
+               speed_limit=0, hash_gate=None):
         self.uploads.append(local_path)
         size = os.path.getsize(local_path)
         name = os.path.basename(local_path)

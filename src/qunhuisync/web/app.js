@@ -180,15 +180,28 @@ function renderJobs() {
       const percent = Math.min(100, file.percent || 0);
       const speed = file.speed ? humanSize(file.speed) + '/s' : '—';
       const cancellingFile = file.cancelled;
+      // 哈希阶段（本地算 MD5）：CPU 密集，还没开始传。
+      // 不显示的话用户会以为这个文件卡死了——实际上它正在排队算哈希。
+      const hashing = !!file.hashing;
+      const hashPercent = Math.min(100, file.hash_percent || 0);
+      const statusChip = hashing
+        ? `<span class="chip warn">计算校验值 ${hashPercent}%</span>`
+        : `<span class="chip ghost">${percent}%</span>`;
+      const progressBar = hashing
+        ? `<div class="progress"><div class="progress-bar hash" style="width:${hashPercent}%"></div></div>`
+        : `<div class="progress"><div class="progress-bar" style="width:${percent}%"></div></div>`;
+      const detail = hashing
+        ? `计算校验值 ${humanSize(file.hash_done || 0)} / ${humanSize(file.hash_size || file.size)}`
+        : `${humanSize(file.done)} / ${humanSize(file.size)} · ${speed}`;
       return `
         <div class="job-file">
           <div class="progress-file">
             <span class="progress-name" title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span>
-            <span class="progress-num">${humanSize(file.done)} / ${humanSize(file.size)} · ${speed}</span>
+            <span class="progress-num">${detail}</span>
           </div>
-          <div class="progress"><div class="progress-bar" style="width:${percent}%"></div></div>
+          ${progressBar}
           <div class="progress-foot">
-            <span class="chip ghost">${percent}%</span>
+            ${statusChip}
             ${cancellingFile
               ? '<span class="chip warn">正在取消…</span>'
               : `<button class="btn small danger" data-act="cancel-file"
@@ -268,21 +281,51 @@ async function refresh() {
 async function loadConfig() {
   const cfg = await api('/api/config');
   $('accRoot').value = cfg.cloud.root_folder_id || '-11';
-  $('accThreads').value = cfg.cloud.upload_threads || 3;
-  $('accWebPassword').value = cfg.server.password || '';
+  $('accThreads').value = cfg.cloud.upload_threads || 2;
+  $('accSpeedLimit').value = cfg.cloud.speed_limit || 0;
+  // 密码本身服务端不回传，只回「有没有设」。
+  // 显示成占位提示，用户一看就知道当前是启用还是关闭状态，
+  // 不会出现「框里是空的但其实有密码」的困惑。
+  const hasPwd = !!(cfg.server && cfg.server.has_password);
+  const pwdInput = $('accWebPassword');
+  pwdInput.value = '';
+  pwdInput.placeholder = hasPwd ? '已启用（留空保存即关闭）' : '留空表示不启用';
+  pwdInput.dataset.hasPassword = hasPwd ? '1' : '';
 }
 
 async function saveAccount() {
+  const pwdInput = $('accWebPassword');
+  const typed = pwdInput.value.trim();
+  const hadPassword = pwdInput.dataset.hasPassword === '1';
   const body = {
     cloud: {
       root_folder_id: $('accRoot').value.trim() || '-11',
-      upload_threads: Math.max(1, Math.min(8, Number($('accThreads').value || 3))),
+      upload_threads: Math.max(1, Math.min(8, Number($('accThreads').value || 2))),
+      speed_limit: Math.max(0, Math.min(1024 * 1024, Number($('accSpeedLimit').value || 0))),
     },
-    server: { password: $('accWebPassword').value },
+    server: { password: typed },
   };
-  if (!body.server.password) webPassword = '';
+  if (!typed) {
+    // 没填密码：
+    // * 之前也没设 -> 保持不启用
+    // * 之前设了 -> 用户想关掉它
+    // 两种情况都传空串，服务端会清空密码。
+    // 但如果之前设了而用户没察觉（框里看不出已设），
+    // 直接清掉会让人措手不及，所以这里明确问一下。
+    if (hadPassword && !confirm('当前已启用网页访问密码，保存后将关闭它，确定吗？')) {
+      return;
+    }
+    webPassword = '';
+    localStorage.removeItem('qhs_password');
+  } else {
+    // 改了密码：本地存的旧密码要一起换掉，
+    // 否则下次打开页面还会用旧密码，被服务端拒绝后又弹密码框。
+    webPassword = typed;
+    localStorage.setItem('qhs_password', typed);
+  }
   await api('/api/config', { method: 'PUT', body });
-  toast('账号设置已保存');
+  toast(typed ? '账号设置已保存' : '账号设置已保存（网页访问密码已关闭）');
+  await loadConfig();
 }
 
 /* ---------------- 二维码登录 ---------------- */

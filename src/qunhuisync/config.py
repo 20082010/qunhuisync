@@ -16,7 +16,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "username": "",
         "password": "",
         "root_folder_id": "-11",
-        "upload_threads": 3,
+        # 同时上传几个文件。这是控制后台资源占用的唯一旋钮：
+        # 线程越多传得越快，占用的 CPU 和带宽也越多。默认 2。
+        "upload_threads": 2,
+        # 上传限速（字节/秒），0 表示不限速。
+        "speed_limit": 0,
     },
     "server": {
         "host": "0.0.0.0",

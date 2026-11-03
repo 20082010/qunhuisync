@@ -50,11 +50,22 @@
     </div>
     <div class="grid">
       <label>根目录 ID<input id="accRoot" placeholder="-11" /></label>
-      <label>上传线程数（同时上传几个文件）
-        <input id="accThreads" type="number" min="1" max="8" value="3" />
+      <label>上传进程数（同时上传几个文件）
+        <input id="accThreads" type="number" min="1" max="8" value="2" />
       </label>
-      <label>网页访问密码（可选）<input id="accWebPassword" type="password" placeholder="留空表示不启用" /></label>
+      <label>上传限速 MB/s（0 = 不限速）
+        <input id="accSpeedLimit" type="number" min="0" max="1000" value="0" />
+      </label>
+      <label>网页访问密码（可选）
+        <input id="accWebPassword" type="password" placeholder="留空表示不启用" />
+      </label>
     </div>
+    <p class="hint">
+      「上传进程数」越大传得越快，占用的 CPU 和带宽也越多，默认 2。
+      后台占用已经自动做了保护：<b>算校验值时只单线程</b>（不会把 CPU 打满），
+      上传线程优先级也比系统低，<b>DSM 界面永远优先</b>。
+      嫌占资源就调小进程数，或用限速压低带宽。
+    </p>
     <div class="qr-box" id="qrBox" hidden>
       <div class="qr-head">
         <span>请用「天翼云盘」App 扫描下方二维码</span>

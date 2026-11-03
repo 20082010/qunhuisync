@@ -1,5 +1,5 @@
 package="qunhuisync"
-version="1.4.3-0005"
+version="1.4.4-0006"
 displayname="群晖电信同步工具"
 maintainer="qunhuisync"
 maintainer_url="https://github.com/synology-189-sync/synology-189-sync"

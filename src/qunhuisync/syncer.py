@@ -374,6 +374,16 @@ class SyncEngine:
             record = rule_state.get(item.rel_path)
             if (record and record.get("size") == item.size
                     and abs(float(record.get("mtime") or 0) - item.mtime) < 1e-6):
+                # 状态里说「已同步」。但如果**源文件还没删掉**
+                # （上一轮删除失败：权限不足、文件被占用），
+                # 这里必须回去补删，不然它会永远留在本地。
+                #
+                # 老记录没有 ``pending_delete`` 字段，一律按「还需要删」处理：
+                # 修复之前写的记录里，就藏着用户反馈的那些文件。
+                if rule.delete_source and record.get("pending_delete", True):
+                    if self._delete_pending_source(rule, job, item):
+                        rule_state.pop(item.rel_path, None)
+                        continue
                 job.bump('skipped')
                 continue
             pending.append(item)
@@ -498,7 +508,21 @@ class SyncEngine:
 
         if existing is not None and existing.size == item.size:
             job.bump('skipped')
-            self._remember(rule_state, state_lock, item, target_name)
+            # 云端已经有这个文件了（上一轮传上去的），本地这份也该删掉。
+            #
+            # 修复前这里直接 return、不删源文件，于是「上一轮上传成功但
+            # 删除失败」的文件会永远命中这个分支，源文件永远留在本地。
+            pending_delete = False
+            if rule.delete_source:
+                try:
+                    os.unlink(item.path)
+                    job.bump('deleted')
+                except OSError as exc:
+                    job.bump('failed')
+                    job.log("删除源文件失败 %s：%s" % (item.rel_path, exc))
+                    pending_delete = True
+            self._remember(rule_state, state_lock, item, target_name,
+                           pending_delete)
             return
 
         if existing is not None and rule.overwrite:
@@ -590,9 +614,13 @@ class SyncEngine:
                 job.log("校验未通过，保留源文件：%s" % item.rel_path)
                 return
 
-        self._remember(rule_state, state_lock, item, target_name)
-
         # 同步成功后直接删除源文件（不再走回收站）
+        #
+        # **删除的结果要记进同步状态**：删失败（权限不足、文件被占用）
+        # 时状态里必须留「还没删」，下一轮才能补删。否则文件上传成功了、
+        # 删除失败，之后每一轮都因为「已经同步过」被跳过，
+        # 源文件就永远留在本地了——用户反馈的正是这个。
+        pending_delete = False
         if rule.delete_source:
             try:
                 os.unlink(item.path)
@@ -600,8 +628,31 @@ class SyncEngine:
             except OSError as exc:
                 job.bump('failed')
                 job.log("删除源文件失败 %s：%s" % (item.rel_path, exc))
+                pending_delete = True
+        self._remember(rule_state, state_lock, item, target_name, pending_delete)
 
     # ---------- 删除源文件 ----------
+    @staticmethod
+    def _delete_pending_source(rule: Rule, job: SyncJob, item: LocalFile) -> bool:
+        """补删一个「已上传但源文件还没删掉」的文件。
+
+        上一轮上传成功了，但删除失败（权限不足、文件被别的程序占用）。
+        同步状态里会留着「还没删」的标记，这里负责补上。
+
+        返回 True 表示这次删掉了。
+        """
+        if not rule.delete_source:
+            return False
+        try:
+            os.unlink(item.path)
+        except OSError as exc:
+            job.bump('failed')
+            job.log("删除源文件失败 %s：%s" % (item.rel_path, exc))
+            return False
+        job.bump('deleted')
+        job.log("补删源文件 %s" % item.rel_path)
+        return True
+
     def _delete_zero_bytes(self, rule: Rule, job: SyncJob,
                            items: List[LocalFile]) -> None:
         """直接删除 0 字节文件。
@@ -626,9 +677,24 @@ class SyncEngine:
 
     @staticmethod
     def _remember(rule_state: Dict[str, Dict], state_lock: Optional[threading.Lock],
-                  item: LocalFile, target_name: str) -> None:
-        """记录已同步的文件（并发时加锁）。"""
-        entry = {"size": item.size, "mtime": item.mtime, "name": target_name}
+                  item: LocalFile, target_name: str,
+                  pending_delete: bool = False) -> None:
+        """记录已同步的文件（并发时加锁）。
+
+        ``pending_delete`` 表示**源文件还需要再删一次**。
+        记这个是为了「删除失败后还能补删」：删除失败（比如权限不足、
+        文件被别的程序占用）时，同步状态里必须留下「还没删」的标记，
+        下一轮才会再来删一次。
+
+        少了这个标记就会出用户说的那个问题：文件上传成功了，
+        但删除失败，之后每一轮都因为「已经同步过」被跳过，
+        源文件就永远留在本地了。
+
+        **老记录（没有这个字段）按「还需要删」处理**：那是修复之前写的，
+        里面就藏着用户反馈的「上传成功却没删掉」的文件，得补删。
+        """
+        entry = {"size": item.size, "mtime": item.mtime, "name": target_name,
+                 "pending_delete": pending_delete}
         if state_lock is not None:
             with state_lock:
                 rule_state[item.rel_path] = entry

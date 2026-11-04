@@ -27,8 +27,8 @@
 在「套件中心 → 安装套件」中选择与你的 NAS 架构匹配的包，勾选「安装后运行」。
 
 ```
-qunhuisync_x86_64-7.2_1.4.4-0012.spk     Intel / AMD 群晖
-qunhuisync_armv8-7.2_1.4.4-0012.spk      ARM64 群晖（DS920+ 等）
+qunhuisync_x86_64-7.2_1.4.4-0013.spk     Intel / AMD 群晖
+qunhuisync_armv8-7.2_1.4.4-0013.spk      ARM64 群晖（DS920+ 等）
 ```
 
 > 下载：仓库右侧 **Releases** → 下载与你的 NAS 架构匹配的那个 `.spk`（附 `.sha256` 校验文件）。
@@ -270,8 +270,8 @@ python build/build_spk.py             # Windows（需 Python 3.8+）
 产物（按架构各一个，DSM 官方要求不同平台的二进制不能打进同一个包）：
 
 ```
-dist/qunhuisync_x86_64-7.2_1.4.4-0012.spk    Intel / AMD 群晖
-dist/qunhuisync_armv8-7.2_1.4.4-0012.spk     ARM64 群晖（DS920+ 等）
+dist/qunhuisync_x86_64-7.2_1.4.4-0013.spk    Intel / AMD 群晖
+dist/qunhuisync_armv8-7.2_1.4.4-0013.spk     ARM64 群晖（DS920+ 等）
 ```
 
 同时生成同名 `.sha256` 校验文件。

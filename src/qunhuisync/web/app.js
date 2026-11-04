@@ -6,6 +6,55 @@ let ACL_MAP = {};
 let editingRuleId = null;
 let webPassword = localStorage.getItem('qhs_password') || '';
 
+// 访问密码：接口返回 401 时弹窗要密码。
+//
+// 以前这里用 prompt()，但那是浏览器弹窗——用户反馈「没有访问入口可以输入」，
+// 而且服务端以前连 index.html 都拦（返回 401），前端 JS 根本没机会运行，
+// 浏览器只显示一句「密码错误」的 JSON。现在改成页面内的登录框。
+//
+// 注意：页面初始化时 loadConfig() 和 refresh() 会**同时**发请求，
+// 两个都收到 401 就会调两次 showLogin()。所以这里要复用同一个 Promise，
+// 否则后一次会把前一次的 resolve 覆盖掉，那个请求永远等不到结果（挂死）。
+let loginPromise = null;
+let loginResolve = null;
+
+function showLogin() {
+  if (loginPromise) return loginPromise;   // 已经弹过了，等同一个结果
+  loginPromise = new Promise((resolve) => {
+    loginResolve = resolve;
+    $('loginError').hidden = true;
+    $('loginPassword').value = '';
+    $('loginModal').hidden = false;
+    $('loginPassword').focus();
+  });
+  return loginPromise;
+}
+
+function closeLogin(value) {
+  $('loginModal').hidden = true;
+  const done = loginResolve;
+  loginResolve = null;
+  loginPromise = null;
+  if (done) done(value);
+}
+
+async function submitLogin() {
+  const pwd = $('loginPassword').value;
+  if (!pwd) return;
+  webPassword = pwd;
+  localStorage.setItem('qhs_password', pwd);
+  // 先拿密码试一下：对了就关窗，错了留在窗上提示
+  try {
+    await api('/api/state', { tolerateError: true, _skipLogin: true });
+    closeLogin(true);
+    refresh();
+  } catch (err) {
+    webPassword = localStorage.getItem('qhs_password') || '';
+    $('loginError').hidden = false;
+    $('loginPassword').select();
+  }
+}
+
 function headers(json) {
   const h = { 'Content-Type': 'application/json' };
   if (webPassword) h['X-QHS-Password'] = webPassword;
@@ -16,16 +65,17 @@ async function api(path, options = {}) {
   const opts = Object.assign({}, options);
   opts.headers = Object.assign(headers(), options.headers || {});
   if (opts.body && typeof opts.body !== 'string') opts.body = JSON.stringify(opts.body);
+  const skipLogin = opts._skipLogin;
   delete opts.tolerateError;
+  delete opts._skipLogin;
   const res = await fetch(path, opts);
   if (res.status === 401) {
-    const pwd = prompt('请输入网页访问密码');
-    if (pwd) {
-      webPassword = pwd;
-      localStorage.setItem('qhs_password', pwd);
-      return api(path, options);
+    // 试一次密码：对了就继续，错了弹登录框
+    if (!skipLogin) {
+      const ok = await showLogin();
+      if (ok) return api(path, options);
     }
-    throw new Error('未授权');
+    throw new Error('密码错误');
   }
   // 反向代理返回 502/504 时，响应体是 HTML 而不是 JSON。
   // 这里必须显式区分，否则会拿到 {}，后面读 .length 直接崩掉整个界面。
@@ -591,6 +641,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   $('btnQrLogin').addEventListener('click', startQrLogin);
   $('btnQrRefresh').addEventListener('click', startQrLogin);
+
+  // 访问密码：回车也能提交
+  $('btnLogin').addEventListener('click', submitLogin);
+  $('loginPassword').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') submitLogin();
+  });
 
   loadConfig().catch(() => {});
   refresh();

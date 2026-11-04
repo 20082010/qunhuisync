@@ -296,6 +296,19 @@ class Handler(BaseHTTPRequestHandler):
         # 先把请求体读干净：HTTP/1.1 keep-alive 下，没读掉的请求体会被
         # 下一个请求当成请求行解析
         self._read_body()
+
+        # **静态文件不鉴权**，只有接口才鉴权。
+        #
+        # 以前是「先鉴权再分发」，于是设了密码之后连 index.html 都返回 401，
+        # 浏览器只看到一句「密码错误」的 JSON —— 前端 JS 根本没机会运行，
+        # 自然也没有输入密码的地方，用户直接卡死在门外。
+        #
+        # 现在静态页面照常返回，里面由前端弹密码框；真正的数据接口
+        # （规则、网盘账号、任务状态）仍然受密码保护。
+        if method == "GET" and not self._is_api_path(path):
+            self._serve_static(path)
+            return
+
         if not self._authorized(params):
             self._json({"error": "密码错误"}, 401)
             return
@@ -314,6 +327,11 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_static(path)
             return
         self._json({"error": "not found"}, 404)
+
+    @staticmethod
+    def _is_api_path(path: str) -> bool:
+        """是不是接口路径（需要密码保护）。"""
+        return path.startswith("/api/")
 
     def _serve_static(self, path: str) -> None:
         if path in ("/", ""):

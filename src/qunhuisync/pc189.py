@@ -57,6 +57,8 @@ from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 from Crypto.Util.Padding import pad
 
+from .util import sanitize_remote_name
+
 log = logging.getLogger("qunhuisync.pc189")
 
 WEB_URL = "https://cloud.189.cn"
@@ -1058,7 +1060,12 @@ class Pc189Client:
 
         服务端正常会直接返回 id；少数情况下不回，这时回查目录列表确认。
         天翼的目录列表有延迟，刚建的目录可能马上还查不到，所以要重试几次。
+
+        **目录名里的 emoji 要先换掉**：实测天翼拒绝带 emoji 的目录名，
+        直接报 ``EmojiArgumentError / Emoji Argument Error``。
+        （文件名那边是 ``SaveFileError``，两处都要处理。）
         """
+        name = sanitize_remote_name(name)
         data = self.request(
             API_URL + "/createFolder.action",
             "POST",

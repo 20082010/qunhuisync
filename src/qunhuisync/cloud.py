@@ -13,7 +13,7 @@ import time
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
-from .util import atomic_write_json, read_json
+from .util import atomic_write_json, read_json, sanitize_remote_name
 
 log = logging.getLogger("qunhuisync.cloud")
 
@@ -192,10 +192,17 @@ class CloudService:
             raise CloudError("创建目录 %s 失败：%s" % (name, exc))
 
     def ensure_folder(self, path: str) -> str:
-        """确保远端路径存在，返回目录 id。"""
+        """确保远端路径存在，返回目录 id。
+
+        **目录名也要去 emoji**：实测天翼拒绝带 emoji 的目录名，
+        报 ``EmojiArgumentError / Emoji Argument Error``（创建目录这一步就失败）。
+        文件名那边早就处理了（``SaveFileError``），目录名这里漏了。
+        """
         current = self.root_id()
         parts = [p for p in (path or "").replace("\\", "/").split("/") if p and p not in (".", "..")]
         for part in parts:
+            # 天翼存不了带 emoji 的目录名，建之前先替换掉。
+            part = sanitize_remote_name(part)
             entries = self.list_dir(current)
             folder = next((e for e in entries if e.is_folder and e.name == part), None)
             if folder is None:
@@ -221,6 +228,9 @@ class CloudService:
         """查找已存在的目录 id，不存在返回 None。"""
         current = self.root_id()
         for part in [p for p in (path or "").replace("\\", "/").split("/") if p and p not in (".", "..")]:
+            # 和 ensure_folder 一样：目录名要先去 emoji，
+            # 否则找的是「带 emoji 的目录」，跟实际建出来的对不上。
+            part = sanitize_remote_name(part)
             entries = self.list_dir(current)
             folder = next((e for e in entries if e.is_folder and e.name == part), None)
             if folder is None:

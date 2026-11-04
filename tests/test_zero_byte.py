@@ -174,8 +174,12 @@ def test_source_deleted_directly_after_sync(tmp_path):
     assert not trash_dirs
 
 
-def test_empty_dirs_checked_before_upload(tmp_path):
-    """空目录检查放在上传之前完成，不与上传抢 CPU。"""
+def test_empty_dirs_checked_after_upload(tmp_path):
+    """空目录检查放在**上传完成之后**。
+
+    「同步成功后删除源文件」是在上传过程中发生的：文件传完就被删掉，
+    目录于是变空。清理必须排在这些删除之后，否则新产生的空目录会漏掉。
+    """
     config = build(tmp_path)
     cloud = FakeCloud()
     engine = SyncEngine(config, cloud)
@@ -189,12 +193,12 @@ def test_empty_dirs_checked_before_upload(tmp_path):
     engine.run(rule, job)
 
     assert not (root / "empty-dir").exists()
-    # 空目录清理的日志应该出现在上传开始之前
+    # 空目录清理的日志应该出现在「同步结束」之前（在上传之后）
     logs = job.logs
     cleanup_idx = next((i for i, line in enumerate(logs) if "清理空目录" in line), None)
-    upload_idx = next((i for i, line in enumerate(logs) if "扫描到" in line), None)
+    end_idx = next((i for i, line in enumerate(logs) if "同步结束" in line), None)
     assert cleanup_idx is not None
-    assert upload_idx is None or cleanup_idx >= upload_idx
+    assert end_idx is None or cleanup_idx < end_idx
 
 
 if __name__ == "__main__":

@@ -348,8 +348,6 @@ class SyncEngine:
         if rule.delete_zero_byte and empty_files:
             job.log("发现 %d 个 0 字节文件，先行删除" % len(empty_files))
             self._delete_zero_bytes(rule, job, empty_files)
-        if rule.delete_empty_dirs:
-            self._cleanup_empty_dirs(rule, job)
 
         if job.cancelled:
             job.log("任务已取消")
@@ -390,6 +388,16 @@ class SyncEngine:
 
         if pending:
             self._upload_all(rule, job, pending, remote_dir_for, rule_state)
+
+        # **空目录清理放在全部上传完成之后**。
+        #
+        # 「同步成功后删除源文件」是在上传**过程中**发生的：文件传完就被删掉，
+        # 目录于是变空。如果清理在上传之前跑，这些新产生的空目录就漏掉了，
+        # 本地会留下一堆空目录。
+        #
+        # 所以：先把文件都传完（源文件也删完），最后再统一清空目录。
+        if rule.delete_empty_dirs:
+            self._cleanup_empty_dirs(rule, job)
 
         if job.cancelled:
             job.log("任务已取消")
@@ -705,18 +713,33 @@ class SyncEngine:
         root = os.path.abspath(rule.local_path)
         if not os.path.isdir(root):
             return
+        excluded = set(rule.exclude_dirs or [])
         removed = 0
-        for dirpath, dirnames, filenames in os.walk(root, topdown=False):
-            if os.path.abspath(dirpath) == os.path.abspath(root):
+        # 自底向上删：先删最深的一层，删完之后上一层的 os.listdir
+        # 才可能变成空的，从而被一起删掉。
+        for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
+            if os.path.abspath(dirpath) == root:
                 continue
-            if os.path.basename(dirpath) in set(rule.exclude_dirs or []):
+            # 排除目录（@eaDir 之类）整棵都不动
+            try:
+                relative = os.path.relpath(dirpath, root)
+            except ValueError:
                 continue
-            if not dirnames and not filenames:
-                try:
-                    os.rmdir(dirpath)
-                    removed += 1
-                except OSError:
-                    pass
+            if any(part in excluded for part in relative.split(os.sep)):
+                continue
+            # **用当前实际内容判断空不空**，不能用 os.walk 给的 dirnames：
+            # 那是扫描那一刻的快照，子目录刚被删掉时它还留在里面，
+            # 会把「已经空了」的父目录误判成「不空」，留着不删。
+            try:
+                if os.listdir(dirpath):
+                    continue
+            except OSError:
+                continue
+            try:
+                os.rmdir(dirpath)
+                removed += 1
+            except OSError:
+                pass
         if removed:
             job.log("清理空目录 %d 个" % removed)
 
